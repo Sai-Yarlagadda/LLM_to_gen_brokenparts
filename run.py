@@ -18,7 +18,6 @@ from src.utils.train_util import instantiate_from_config
 from src.utils.camera_util import (FOV_to_intrinsics, get_zero123plus_input_cameras,get_circular_camera_poses,)
 from src.utils.mesh_util import save_obj, save_obj_with_mtl
 from grounding_dino.GroundingDINO.groundingdino.util.inference import load_model, load_image, predict, annotate
-#from groundingdino.util.inference import load_model, load_image, predict, annotate
 import cv2
 from torchvision.ops import box_convert
 import supervision as sv
@@ -41,7 +40,7 @@ def preprocess(input_image, do_remove_background):
 
 def generate_mvs(input_image, sample_steps, sample_seed, pipeline):
     seed_everything(sample_seed)
-    device = torch.device('cuda')
+    device = torch.device('cuda:1')
     generator = torch.Generator(device=device)
     z123_image = pipeline(
         input_image, 
@@ -86,9 +85,6 @@ def make_mesh(mesh_fpath, planes, model, infer_config):
     with torch.no_grad():
         mesh_out = model.extract_mesh(planes, use_texture_map=True, **infer_config,)
         vertices, faces, uvs, mesh_tex_idx, tex_map = mesh_out
-        # vertices = vertices[:, [1, 2, 0]]
-        # vertices[:, -1] *= -1
-        # faces = faces[:, [2, 1, 0]]
         save_obj_with_mtl(
             vertices.data.cpu().numpy(),
             uvs.data.cpu().numpy(),
@@ -98,16 +94,10 @@ def make_mesh(mesh_fpath, planes, model, infer_config):
             mesh_fpath,
         )
         print(f"Mesh with texmap saved to {mesh_fpath}")
-        # vertices, faces, vertex_colors = mesh_out
-        # vertices = vertices[:, [1, 2, 0]]
-        # vertices[:, -1] *= -1
-        # faces = faces[:, [2, 1, 0]]
-        # save_obj(vertices, faces, vertex_colors, mesh_fpath)
-        # print(f"Mesh saved to {mesh_fpath}")
     return mesh_fpath
 
 def make3d(images, model, infer_config, IS_FLEXICUBES, part_name):
-    device = 'cuda' #change the device over here
+    device = 'cuda:1' #change the device over here
     images = np.asarray(images, dtype=np.float32) / 255.0
     images = torch.from_numpy(images).permute(2, 0, 1).contiguous().float()     # (3, 960, 640)
     images = rearrange(images, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)        # (6, 3, 320, 320)
@@ -120,12 +110,10 @@ def make3d(images, model, infer_config, IS_FLEXICUBES, part_name):
     if not os.path.exists(directory):
         os.makedirs(directory)
     tempfile.tempdir = directory
-    #mesh_fpath = f'{part_name}.obj'
     mesh_fpath = tempfile.NamedTemporaryFile(prefix=f'{part_name}', suffix=f".obj", delete=False).name
     print(mesh_fpath)
     mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
     mesh_dirname = os.path.dirname(mesh_fpath)
-    #video_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.mp4")
 
     with torch.no_grad():
         planes = model.forward_planes(images, input_cameras)
@@ -146,10 +134,53 @@ def make3d(images, model, infer_config, IS_FLEXICUBES, part_name):
     print(f'INFO:: Mesh file saved at: {mesh_fpath}')
     return mesh_fpath
 
+def get_mv_images(input_image_path, Savemv_imgs_at = 'mv_images_completepart.png'):
+    torch.cuda.empty_cache()
+    pipeline = DiffusionPipeline.from_pretrained("sudo-ai/zero123plus-v1.2", custom_pipeline="zero123plus",torch_dtype=torch.float16,)
+    pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config, timestep_spacing='trailing')
+    unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model")
+    state_dict = torch.load(unet_ckpt_path, map_location='cpu')
+    pipeline.unet.load_state_dict(state_dict, strict=True)
+    device = torch.device('cuda:1')
+    pipeline = pipeline.to(device) # should be outside the loop to make the code more memory efficient
+    seed_everything(0)
+    input_image_path = input_image_path #@param {type:"string"}
+    input_image = Image.open(input_image_path)
+    #processed_image = preprocess(input_image, True)
+    #processed_image
+    mv_images, mv_show_images = generate_mvs(input_image, 75, 42, pipeline)
+    mv_images.save(Savemv_imgs_at)
+    print(f'INFO:: Multiview imagem images saved at {Savemv_imgs_at}')
+
+def get_obj_file(TEXT_PROMPT, mv_images_path = 'mv_images_completepart.png'):
+    torch.cuda.empty_cache()
+    config_path = 'configs/instant-mesh-base.yaml'
+    config = OmegaConf.load(config_path)
+    config_name = os.path.basename(config_path).replace('.yaml', '')
+    model_config = config.model_config
+    infer_config = config.infer_config
+    model_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="instant_mesh_base.ckpt", repo_type="model")
+    model = instantiate_from_config(model_config)
+    state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
+    state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.') and 'source_camera' not in k}
+    model.load_state_dict(state_dict, strict=True)
+    device = torch.device('cuda:1')
+    model = model.to(device)
+    IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
+    if IS_FLEXICUBES:
+        model.init_flexicubes_geometry(device, fovy=30.0)
+    model = model.eval()
+    mv_images = Image.open(mv_images_path)
+    output_model_obj = make3d(mv_images, model, infer_config, IS_FLEXICUBES, TEXT_PROMPT)
+    print('INFO:: The mesh file is created')
+    return output_model_obj
+
+
 def main():
+    
     #get bounding box of the broken image
-    IMAGE_PATH = "images/broken_images/brokenmug.png"
-    TEXT_PROMPT = "main part"
+    IMAGE_PATH = "images/broken_images/brokentoy1.png"
+    TEXT_PROMPT = "Toy"
     BOX_TRESHOLD = 0.35
     TEXT_TRESHOLD = 0.25
 
@@ -165,11 +196,32 @@ def main():
     
     #run the stable diffusion model to generate image
     torch.cuda.empty_cache()
-    get_complete_image(IMAGE_PATH, mask_image_path="Testmask.png", PROMPT= "Glass with a handle.", CORRECTED_img_path='correct_image_path.png')
+    get_complete_image(IMAGE_PATH, mask_image_path="Testmask.png", PROMPT= "A new wine glass that is not broken", CORRECTED_img_path='correct_image_path.png')
     
     #remove the background and in both the broken image and corrected image
     remove_background(IMAGE_PATH, "broken_img_noback.png")
-    remove_background("correct_image_path.png", "correct_image_noback.png")
+    
+
+    #remove the complete background of the correct image
+    bbox_coordinates = get_bbox(IMAGE_PATH='correct_image_path.png',
+                                TEXT_PROMPT=TEXT_PROMPT)
+    
+    #get mask of the broken part
+    torch.cuda.empty_cache()
+    get_mask(IMAGE_PATH='correct_image_path.png',
+             box_coordinates=bbox_coordinates,
+             MASK_IMAGE_PATH="MaskCorrect.png")
+    
+    corr_img = cv2.imread('correct_image_path.png')
+    corr_mask = cv2.imread('MaskCorrect.png', cv2.IMREAD_GRAYSCALE)
+    corr_mask = cv2.bitwise_not(corr_mask)
+    _, binary_mask = cv2.threshold(corr_mask, 127, 255, cv2.THRESH_BINARY)
+    masked_image = cv2.bitwise_and(corr_img, corr_img, mask=binary_mask)
+    result_path = 'correct_image_noback.png'
+    cv2.imwrite(result_path, masked_image)
+
+
+    #remove_background("correct_image_path.png", "correct_image_noback.png")
 
     #get multiple views
     torch.cuda.empty_cache()
@@ -178,15 +230,15 @@ def main():
     unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model")
     state_dict = torch.load(unet_ckpt_path, map_location='cpu')
     pipeline.unet.load_state_dict(state_dict, strict=True)
-    device = torch.device('cuda')
+    device = torch.device('cuda:1')
     pipeline = pipeline.to(device)
     seed_everything(0)
-    input_image_path = 'correct_image_noback.png' #@param {type:"string"}
+    input_image_path = 'images/broken_images/brokentoy1.png' #@param {type:"string"}
     input_image = Image.open(input_image_path)
     #processed_image = preprocess(input_image, True)
     #processed_image
     mv_images, mv_show_images = generate_mvs(input_image, 75, 42, pipeline)
-    mv_images.save('mv_images.png')
+    mv_images.save('mv_images_completepart.png')
     
     #get mesh
     torch.cuda.empty_cache()
@@ -200,15 +252,66 @@ def main():
     state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
     state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.') and 'source_camera' not in k}
     model.load_state_dict(state_dict, strict=True)
-    device = torch.device('cuda')
+    device = torch.device('cuda:1')
     model = model.to(device)
     IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
     if IS_FLEXICUBES:
         model.init_flexicubes_geometry(device, fovy=30.0)
     model = model.eval()
-    mv_images = Image.open('mv_images.png')
-    output_model_obj = make3d(mv_images, model, infer_config, IS_FLEXICUBES, 'Mug')
+    mv_images = Image.open('mv_images_completepart.png')
+    output_model_obj = make3d(mv_images, model, infer_config, IS_FLEXICUBES, TEXT_PROMPT)
+
+    #subtract the broken image from the corrected image
+    only_broken_part_path = remove_not_brokenpart(broken_img_path = IMAGE_PATH,
+                                                   correct_img_path = 'correct_image_noback.png', 
+                                                   SaveBrokenPartImageat = 'only_missing_part_broken_img.png')
+    
+    #get mv of only broken part
+    torch.cuda.empty_cache()
+    pipeline = DiffusionPipeline.from_pretrained("sudo-ai/zero123plus-v1.2", custom_pipeline="zero123plus",torch_dtype=torch.float16,)
+    pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config, timestep_spacing='trailing')
+    unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model")
+    state_dict = torch.load(unet_ckpt_path, map_location='cpu')
+    pipeline.unet.load_state_dict(state_dict, strict=True)
+    device = torch.device('cuda:1')
+    pipeline = pipeline.to(device)
+    seed_everything(0)
+    input_image_path = only_broken_part_path #@param {type:"string"}
+    input_image = Image.open(input_image_path)
+    #processed_image = preprocess(input_image, True)
+    #processed_image
+    mv_images, mv_show_images = generate_mvs(input_image, 75, 42, pipeline)
+    mv_images.save('mv_images_only_brokenpart.png')
+
+    #get 3d model of only brokenpart
+    torch.cuda.empty_cache()
+    config_path = 'configs/instant-mesh-base.yaml'
+    config = OmegaConf.load(config_path)
+    config_name = os.path.basename(config_path).replace('.yaml', '')
+    model_config = config.model_config
+    infer_config = config.infer_config
+    model_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="instant_mesh_base.ckpt", repo_type="model")
+    model = instantiate_from_config(model_config)
+    state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
+    state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.') and 'source_camera' not in k}
+    model.load_state_dict(state_dict, strict=True)
+    device = torch.device('cuda:1')
+    model = model.to(device)
+    IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
+    if IS_FLEXICUBES:
+        model.init_flexicubes_geometry(device, fovy=30.0)
+    model = model.eval()
+    mv_images = Image.open('mv_images_only_brokenpart.png')
+    output_model_obj = make3d(mv_images, model, infer_config, IS_FLEXICUBES, 'BrokenPart')
+
     return output_model_obj
+
+def get_args():
+    pass
 
 if __name__ == '__main__':
     main()
+    """IMAGE_PATH = "images/broken_images/brokenwineglass.png"
+    get_mv_images(IMAGE_PATH, Savemv_imgs_at = 'mv_images_brokenpart.png')
+    output = get_obj_file('Wine_Glass', 'mv_images_brokenpart.png')
+    print('Done')"""

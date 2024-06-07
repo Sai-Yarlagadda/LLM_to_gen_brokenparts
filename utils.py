@@ -13,7 +13,7 @@ from PIL import Image
 import gradio as gr
 from diffusers import StableDiffusionInpaintPipeline
 from rembg import remove
-
+import pyvista as pv
 
 def get_bbox(IMAGE_PATH:str,
              TEXT_PROMPT:str,
@@ -28,7 +28,7 @@ def get_bbox(IMAGE_PATH:str,
     BOX_THRESHOLD
     TEXT_THRESHOLD
     """
-     
+
     model = load_model("grounding_dino/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py", "grounding_dino/GroundingDINO/weights/groundingdino_swint_ogc.pth")
     image_source, image = load_image(IMAGE_PATH)
     print(image.shape)
@@ -109,6 +109,7 @@ def get_mask(IMAGE_PATH:str,
 
     cv2.imwrite(MASK_IMAGE_PATH, mask_uint8)
     print(f"INFO:: Mask is successfully saved at {MASK_IMAGE_PATH}")
+    return MASK_IMAGE_PATH
 
 def init_stable_diffusion_model():
     device = 'cuda'
@@ -121,7 +122,7 @@ def get_complete_image(broken_image_path:str,
                        CORRECTED_img_path:str,
                        guidance_scale = 7.5,
                        num_samples = 1,
-                       SEED = 1):
+                       SEED = 0):
     device, model_path = init_stable_diffusion_model()
     try:
         pipe = StableDiffusionInpaintPipeline.from_pretrained(model_path,
@@ -156,10 +157,41 @@ def remove_background(IMAGE_PATH:str,
     output = remove(input_img)
     output.save(output_path)
     print(f"INFO:: Removed background of image: {output_path}")
+    return output_path
+
+def remove_not_brokenpart(broken_img_path, correct_img_path, SaveBrokenPartImageat):
+    #compare the masks of original image and corrected image
+    bb_cords_correct = get_bbox(correct_img_path, 'main object in the image')
+    bb_cords_broken = get_bbox(broken_img_path, 'main object in the image')
+    correct_image_mask_path = get_mask(correct_img_path, bb_cords_correct, 'tmp/images/correctmask_image.png')
+    broken_image_mask_path = get_mask(broken_img_path, bb_cords_broken, 'tmp/images/brokenmask_image.png')
+    broken_img_mask = cv2.imread(broken_image_mask_path, cv2.IMREAD_GRAYSCALE)
+    correct_image_mask = cv2.imread(correct_image_mask_path, cv2.IMREAD_GRAYSCALE)
+    diff_mask = cv2.subtract(broken_img_mask, correct_image_mask)
+    cv2.imwrite('tmp/images/brokenpart_mask.png', diff_mask)
+
+    final_image = cv2.imread(correct_img_path)
+    mask = cv2.imread('tmp/images/brokenpart_mask.png', cv2.COLOR_BGR2GRAY)
+    result = np.dstack((final_image, mask))
+    cv2.imwrite(SaveBrokenPartImageat, result)
+
+    print("INFO:: Only the broken part image is generated.")
+    return SaveBrokenPartImageat
+
+def remove_broken_part_pyvista(broken_obj_path, 
+                               correct_obj_path, 
+                               Savestl_only_broken_part= 'OnlyBrokenPart.stl'):
+    corr_mesh = pv.read(correct_obj_path)
+    corr_mesh = corr_mesh.extract_surface().smooth(n_iter=10) #MAKES THE MESH FINER AND BETTER
+    bro_mesh = pv.read(broken_obj_path)
+    result = corr_mesh.boolean_difference(bro_mesh)
+    result.save(Savestl_only_broken_part)
+    print('INFO:: The STL file of the broken part is saved at ')
+    
 
 """
 if __name__ == '__main__':
-    IMAGE_PATH = "images/broken images/brokenmug.png"
+    IMAGE_PATH = "images/broken_images/brokenwineglass.png"
     TEXT_PROMPT = "main part"
     BOX_TRESHOLD = 0.35
     TEXT_TRESHOLD = 0.25
@@ -172,5 +204,15 @@ if __name__ == '__main__':
     get_complete_image(IMAGE_PATH, mask_image_path="Testmask.png", PROMPT= "Complete image of Glass Mug", CORRECTED_img_path='correct_image_path.png')
     remove_background(IMAGE_PATH, "broken_img_noback.png")
     remove_background("correct_image_path.png", "correct_image_noback.png")
-"""
+    #only_broken_part_path = remove_not_brokenpart(broken_img_path = IMAGE_PATH,
+    #                                               correct_img_path = 'correct_image_noback.png', 
+    #                                               SaveBrokenPartImageat = 'only_missing_part_broken_img.png')
+    #print("Done!")
+    correct_image_mask = cv2.imread('tmp/images/correctmask_image.png')
+    broken_image_mask = cv2.imread('tmp/images/brokenmask_image.png')
+    diff_mask = cv2.subtract(broken_image_mask, correct_image_mask)
+    #cv2.imwrite("Image_subtracted.png", diff_mask)
+    #cv2.waitKey(0)
+    #cv2.destroyAllWindows()
 
+"""
